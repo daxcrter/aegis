@@ -1,0 +1,9 @@
+python/venv
+
+python/output_video
+
+python/output
+
+rust/target
+
+rust/.env
