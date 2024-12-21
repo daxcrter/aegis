@@ -221,7 +221,7 @@ class Cam:
                             return
 
             except websockets.exceptions.ConnectionClosed:
-                print("Connection lost, reconnecting...")
+                print("Connection lost , reconnecting...")
                 await asyncio.sleep(1)
             except Exception as e:
                 print(f"Error: {e}")
