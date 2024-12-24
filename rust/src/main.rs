@@ -1,239 +1,212 @@
-use anyhow::Result;
-use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt, TryStreamExt}; 
-use image::{ImageBuffer, Rgb};
+use tokio::{self, sync::mpsc, time::Duration};
+use tokio_tungstenite::accept_async;
+use futures::{SinkExt, StreamExt};
 use nokhwa::{
     pixel_format::RgbFormat,
-    utils::{ApiBackend, CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution},
-    Camera, query,
+    utils::{CameraFormat, FrameFormat, CameraIndex, RequestedFormat, RequestedFormatType, Resolution},
+    Camera,
 };
-use serde::{Deserialize, Serialize};
-use std::{
-    sync::Arc,
-    time::Duration,
-};
-use tokio::{
-    sync::Mutex,
-    time::sleep,
-};
-use tokio_tungstenite::{
-    accept_async,
-    tungstenite::Message,
-};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use chrono::Local;
+use log::{error, info};
+use std::collections::VecDeque;
+use std::thread;
 
-// Constants
-const MIN_FPS: u32 = 10;
-const MAX_FPS: u32 = 30;
-const WIDTH: u32 = 640;
-const HEIGHT: u32 = 480;
-const PORT: u16 = 5000;
-
-#[derive(Serialize, Deserialize, Debug)]
-struct FrameRateRequest {
-    target_fps: u32,
-    faces_detected: u32,
-    motion_level: f32,
+#[derive(Clone)]
+struct Frame {
+    data: Vec<u8>,
+    ts: i64,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct CameraState {
-    current_fps: u32,
-    is_streaming: bool,
-    error_count: u32,
+#[derive(Clone)]
+struct Chunk {
+    frames: Vec<Frame>,
+    start_ts: i64,
 }
 
-struct AdaptiveCamera {
-    camera: Camera,
-    state: Arc<Mutex<CameraState>>,
+struct Queue {
+    chunks: VecDeque<Chunk>,
+    current_chunk: Option<Chunk>,
+    chunk_duration: i64,
 }
 
-impl AdaptiveCamera {
-    fn new() -> Result<Self> {
-        let fmt = RequestedFormat::new::<RgbFormat>(
-            RequestedFormatType::Exact(
-                CameraFormat::new(
-                    Resolution::new(WIDTH, HEIGHT),
-                    FrameFormat::NV12,
-                    MIN_FPS,
-                )
-            )
-        );
-
-        let mut camera = Camera::new(
-            CameraIndex::Index(0),
-            fmt,
-        )?;
-
-        camera.open_stream()?;
-
-        let state = Arc::new(Mutex::new(CameraState {
-            current_fps: MIN_FPS,
-            is_streaming: true,
-            error_count: 0,
-        }));
-
-        Ok(Self { camera, state })
-    }
-
-    async fn update_framerate(&mut self, request: FrameRateRequest) -> Result<()> {
-        let mut state = self.state.lock().await;
-        
-        // Calculate new FPS based on detection results
-        let target_fps = (request.target_fps)
-            .min(MAX_FPS)
-            .max(MIN_FPS);
-
-        if target_fps != state.current_fps {
-            // Update camera format with new FPS
-            let fmt = RequestedFormat::new::<RgbFormat>(
-                RequestedFormatType::Exact(
-                    CameraFormat::new(
-                        Resolution::new(WIDTH, HEIGHT),
-                        FrameFormat::NV12,
-                        target_fps,
-                    )
-                )
-            );
-
-            // Safely update camera settings
-            self.camera.stop_stream()?;
-            self.camera.set_camera_requset(fmt)?;  // Fixed typo in method name
-            self.camera.open_stream()?;
-            
-            state.current_fps = target_fps;
+impl Queue {
+    fn new(chunk_duration: i64) -> Self {
+        Self {
+            chunks: VecDeque::new(),
+            current_chunk: None,
+            chunk_duration,
         }
-
-        Ok(())
     }
 
-    async fn capture_frame(&mut self) -> Result<Vec<u8>> {
-        // Move state acquisition after potential error handling
-        match self.camera.frame() {
-            Ok(frame) => {
-                let rgb = frame.decode_image::<RgbFormat>()?;
-                let resolution = frame.resolution();
-                
-                // Create image buffer
-                let img = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_raw(
-                    resolution.width(),
-                    resolution.height(),
-                    rgb.into_raw(),
-                ).ok_or_else(|| anyhow::anyhow!("Failed to create image buffer"))?;
-
-                // Encode to JPEG
-                let mut jpg = Vec::new();
-                let mut enc = image::codecs::jpeg::JpegEncoder::new(&mut jpg);
-                enc.encode(
-                    img.as_raw(),
-                    resolution.width(),
-                    resolution.height(),
-                    image::ColorType::Rgb8,
-                )?;
-
-                let mut state = self.state.lock().await;
-                state.error_count = 0;
-                Ok(jpg)
-            }
-            Err(e) => {
-                let mut state = self.state.lock().await;
-                state.error_count += 1;
-                
-                // If too many errors, try to reset camera
-                if state.error_count > 5 {
-                    drop(state);  // Drop the lock before calling reset_camera
-                    self.reset_camera().await?;
+    fn push_frame(&mut self, frame: Frame) {
+        match &mut self.current_chunk {
+            Some(chunk) => {
+                // If chunk duration exceeded, finalize current chunk
+                if frame.ts - chunk.start_ts >= self.chunk_duration {
+                    let complete_chunk = std::mem::replace(&mut self.current_chunk, 
+                        Some(Chunk {
+                            frames: vec![frame],
+                            start_ts: frame.ts,
+                        })
+                    );
+                    if let Some(chunk) = complete_chunk {
+                        self.chunks.push_back(chunk);
+                    }
+                } else {
+                    chunk.frames.push(frame);
                 }
-                
-                Err(e.into())
+            }
+            None => {
+                // Start new chunk
+                self.current_chunk = Some(Chunk {
+                    frames: vec![frame],
+                    start_ts: frame.ts,
+                });
             }
         }
     }
 
-    async fn reset_camera(&mut self) -> Result<()> {
-        let mut state = self.state.lock().await;
-        
-        // Stop current stream
-        self.camera.stop_stream()?;
-        
-        // Reset to minimum FPS
-        let fmt = RequestedFormat::new::<RgbFormat>(
-            RequestedFormatType::Exact(
-                CameraFormat::new(
-                    Resolution::new(WIDTH, HEIGHT),
-                    FrameFormat::NV12,
-                    MIN_FPS,
-                )
-            )
-        );
+    fn pop_chunk(&mut self) -> Option<Chunk> {
+        self.chunks.pop_front()
+    }
 
-        self.camera.set_camera_requset(fmt)?;  // Fixed typo in method name
-        self.camera.open_stream()?;
-        
-        state.current_fps = MIN_FPS;
-        state.error_count = 0;
-        
-        Ok(())
+    fn finalize_current(&mut self) {
+        if let Some(chunk) = self.current_chunk.take() {
+            if !chunk.frames.is_empty() {
+                self.chunks.push_back(chunk);
+            }
+        }
     }
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    // Query available cameras
-    let cameras = query(ApiBackend::Auto)?;
-    for camera in cameras {
-        println!("Found camera: {:?}", camera);
-    }
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    
+    let addr = "127.0.0.1:5000";
+    let queue = Arc::new(Mutex::new(Queue::new(10))); // 10 second chunks
+    let (tx, rx) = mpsc::channel(32);
+    let rx = Arc::new(Mutex::new(rx));
+    
+    // Init camera in a separate thread
+    let q = Arc::clone(&queue);
+    let tx_clone = tx.clone();
+    
+    thread::spawn(move || {
+        let mut cam = match Camera::new(
+            CameraIndex::Index(0), 
+            RequestedFormat::new::<RgbFormat>(
+                RequestedFormatType::Exact(
+                    CameraFormat::new(
+                        Resolution::new(1280, 720),
+                        FrameFormat::MJPEG,
+                        30,
+                    ),
+                ),
+            ),
+        ) {
+            Ok(cam) => cam,
+            Err(e) => {
+                error!("[ERROR] Failed to initialize camera: {}", e);
+                return;
+            }
+        };
 
-    let camera = Arc::new(Mutex::new(AdaptiveCamera::new()?));
-    println!("Camera initialized at {}x{}", WIDTH, HEIGHT);
+        if let Err(e) = cam.open_stream() {
+            error!("[ERROR] Failed to open camera stream: {}", e);
+            return;
+        }
 
-    let addr = format!("127.0.0.1:{}", PORT);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    println!("WebSocket server listening on ws://{}", addr);
-
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut last_finalize = Local::now().timestamp();
+        
+        loop {
+            match cam.frame() {
+                Ok(frame) => {
+                    let current_ts = Local::now().timestamp();
+                    let frame = Frame {
+                        data: frame.buffer().to_vec(),
+                        ts: current_ts,
+                    };
+                    
+                    rt.block_on(async {
+                        let mut queue = q.lock().await;
+                        queue.push_frame(frame.clone());
+                        
+                        // Check if it's time to finalize current chunk
+                        if current_ts - last_finalize >= 10 {
+                            queue.finalize_current();
+                            // Send the latest complete chunk
+                            if let Some(chunk) = queue.pop_chunk() {
+                                if let Err(e) = tx_clone.send(chunk).await {
+                                    error!("[ERROR] Send failed: {}", e);
+                                }
+                            }
+                            last_finalize = current_ts;
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("[ERROR] Frame capture failed: {}", e);
+                }
+            }
+            
+            thread::sleep(Duration::from_millis(33)); // ~30 fps
+        }
+    });
+    
+    // WS server
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    
     while let Ok((stream, _)) = listener.accept().await {
-        let camera = camera.clone();
+        let ws = accept_async(stream).await?;
+        let (mut sender, _) = ws.split();
+        let rx = Arc::clone(&rx);
+        let q = Arc::clone(&queue);
         
         tokio::spawn(async move {
-            let ws_stream = accept_async(stream).await.expect("Failed to accept connection");
-            let (mut ws_tx, mut ws_rx) = ws_stream.split();
+            // Send queued chunks first
+            {
+                let mut queue = q.lock().await;
+                queue.finalize_current(); // Finalize any in-progress chunk
+                while let Some(chunk) = queue.pop_chunk() {
+                    // Combine all frames in chunk into single buffer
+                    let mut combined_data = Vec::new();
+                    for frame in chunk.frames {
+                        combined_data.extend(frame.data);
+                    }
+                    
+                    if let Err(e) = sender.send(combined_data.into()).await {
+                        error!("[ERROR] Queue send failed: {}", e);
+                        break;
+                    }
+                }
+            }
             
-            println!("New client connected");
-
-            loop {
-                let mut camera = camera.lock().await;
-                
-                // Handle incoming messages (frame rate requests)
-                if let Ok(Some(msg)) = ws_rx.try_next().await {  // Added .await
-                    if let Ok(request) = serde_json::from_str(&String::from_utf8_lossy(&msg.into_data())) {
-                        if let Err(e) = camera.update_framerate(request).await {
-                            eprintln!("Failed to update framerate: {}", e);
-                        }
-                    }
+            // Handle new chunks
+            let mut rx = rx.lock().await;
+            while let Some(chunk) = rx.recv().await {
+                let mut combined_data = Vec::new();
+                for frame in chunk.frames {
+                    combined_data.extend(frame.data);
                 }
-
-                // Capture and send frame
-                match camera.capture_frame().await {
-                    Ok(jpg) => {
-                        if let Err(e) = ws_tx.send(Message::Binary(Bytes::from(jpg))).await {
-                            eprintln!("Failed to send frame: {}", e);
-                            break;
-                        }
-                    }
+                
+                match sender.send(combined_data.into()).await {
+                    Ok(_) => {}
                     Err(e) => {
-                        eprintln!("Frame capture error: {}", e);
-                        sleep(Duration::from_millis(100)).await;
+                        error!("[ERROR] Send failed: {}", e);
+                        q.lock().await.push_frame(Frame {
+                            data: combined_data,
+                            ts: Local::now().timestamp(),
+                        });
+                        break;
                     }
                 }
-
-                let state = camera.state.lock().await;
-                let delay = Duration::from_secs(1) / state.current_fps;
-                drop(state);
-                
-                sleep(delay).await;
             }
         });
     }
-
+    
     Ok(())
 }

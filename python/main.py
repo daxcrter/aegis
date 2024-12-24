@@ -1,232 +1,206 @@
 import asyncio
 import cv2
-import json
 import numpy as np
 import websockets
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Optional
 import mediapipe as mp
+import face_recognition
+from datetime import datetime
+from pathlib import Path
+from queue import Queue
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
 from PIL import ImageFont, ImageDraw, Image
+import time
+import uuid
+import os
 
 @dataclass
 class Frame:
-    faces: int
-    motion: float
+    id: str
+    timestamp: float
+    data: np.ndarray
 
-class Cam:
-    def __init__(self, url: str = "ws://localhost:5000"):
-        self.url = url
-        self.prev = None
-        self.bg_sub = cv2.createBackgroundSubtractorMOG2(
-            history=500,
-            varThreshold=16,
-            detectShadows=False
-        )
+class Storage:
+    def __init__(self, directory: str = "frames"):
+        self.directory = Path(directory)
+        self.directory.mkdir(exist_ok=True)
         
-        # Face detection
-        self.mp_face = mp.solutions.face_detection
-        self.detector = self.mp_face.FaceDetection(
-            model_selection=1,
-            min_detection_confidence=0.5
-        )
+    def save(self, frame: Frame) -> None:
+        path = self.directory / f"{frame.id}.npy"
+        np.save(str(path), frame.data)
         
-        # FPS settings
-        self.min_fps = 10
-        self.max_fps = 30
-        self.fps = self.min_fps
-        self.last_fps_update = 0
-        self.fps_cooldown = 2.0
+    def load(self, frame_id: str) -> Optional[np.ndarray]:
+        path = self.directory / f"{frame_id}.npy"
+        if path.exists():
+            return np.load(str(path))
+        return None
         
-        # Stats
-        self.frames = 0
-        self.errors = 0
-        self.max_errors = 5
-        
-        # Load Montserrat font
-        try:
-            self.font = ImageFont.truetype("Montserrat-Regular.ttf", 20)
-            self.font_bold = ImageFont.truetype("Montserrat-Bold.ttf", 24)
-        except:
-            # Fallback to a default font if Montserrat is not available
-            print("Montserrat font not found, using default font")
-            self.font = None
-            self.font_bold = None
-        
-        # Recording indicator animation
-        self.rec_alpha = 0
-        self.rec_increasing = True
+    def cleanup(self, keep_ids: List[str]) -> None:
+        for path in self.directory.glob("*.npy"):
+            if path.stem not in keep_ids:
+                path.unlink()
 
-    def draw_overlay(self, frame: np.ndarray) -> np.ndarray:
-        """Draw camera overlay with Montserrat font"""
-        # Convert to PIL Image for better text rendering
-        pil_im = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        draw = ImageDraw.Draw(pil_im)
+class Queue:
+    def __init__(self, maxsize: int = 100):
+        self.raw = asyncio.Queue(maxsize)
+        self.processed = asyncio.Queue(maxsize)
+        self.frames: Dict[str, float] = {}
+        self.storage = Storage()
+        self.cleanup_threshold = maxsize * 2
         
-        # Background overlay for text
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (0, 0), (frame.shape[1], 60), (0, 0, 0), -1)
-        frame = cv2.addWeighted(overlay, 0.3, frame, 0.7, 0)
+    async def add_raw(self, data: np.ndarray) -> None:
+        frame_id = str(uuid.uuid4())
+        frame = Frame(frame_id, time.time(), data)
+        self.frames[frame_id] = frame.timestamp
+        self.storage.save(frame)
+        await self.raw.put(frame_id)
         
-        # Current time
-        time = datetime.now().strftime("%H:%M:%S")
-        date = datetime.now().strftime("%Y-%m-%d")
-        
-        # Recording indicator animation
-        if self.rec_increasing:
-            self.rec_alpha += 0.1
-            if self.rec_alpha >= 1.0:
-                self.rec_increasing = False
-        else:
-            self.rec_alpha -= 0.1
-            if self.rec_alpha <= 0.0:
-                self.rec_increasing = True
-        
-        # Draw text with Montserrat (or fallback to OpenCV if font not available)
-        if self.font and self.font_bold:
-            # Time and date
-            draw.text((20, 10), f"{time}", font=self.font_bold, fill=(255, 255, 255))
-            draw.text((20, 40), f"{date}", font=self.font, fill=(200, 200, 200))
+        if len(self.frames) > self.cleanup_threshold:
+            self._cleanup()
             
-            # FPS and recording status
-            draw.text((200, 10), f"FPS: {self.fps}", font=self.font, fill=(200, 200, 200))
-            rec_color = (255, 0, 0) if self.rec_alpha > 0.5 else (150, 0, 0)
-            draw.text((200, 40), "REC", font=self.font_bold, fill=rec_color)
+    async def add_processed(self, frame_id: str) -> None:
+        await self.processed.put(frame_id)
+        
+    async def get_raw(self) -> Optional[Tuple[str, np.ndarray]]:
+        if self.raw.empty():
+            return None
+        frame_id = await self.raw.get()
+        data = self.storage.load(frame_id)
+        return frame_id, data
+        
+    async def get_processed(self) -> Optional[np.ndarray]:
+        if self.processed.empty():
+            return np.zeros((480, 640, 3), dtype=np.uint8)
+        frame_id = await self.processed.get()
+        return self.storage.load(frame_id)
+        
+    def _cleanup(self) -> None:
+        current = time.time()
+        expired = [fid for fid, ts in self.frames.items() 
+                  if current - ts > 30]  # Keep last 30 seconds
+        for fid in expired:
+            del self.frames[fid]
+        self.storage.cleanup(list(self.frames.keys()))
+
+class Processor:
+    def __init__(self):
+        self.face_det = mp.solutions.face_detection.FaceDetection(
+            min_detection_confidence=0.7)
+        self.faces: Dict[str, List[np.ndarray]] = {}
+        self.last_frame = None
+        self._load_faces()
+        
+    def _load_faces(self):
+        face_dir = Path('faces')
+        if not face_dir.exists():
+            return
             
-            # Convert back to OpenCV format
-            frame = cv2.cvtColor(np.array(pil_im), cv2.COLOR_RGB2BGR)
-        else:
-            # Fallback to OpenCV text rendering
-            cv2.putText(frame, f"{time}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-            cv2.putText(frame, f"{date}", (20, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1)
-            cv2.putText(frame, f"FPS: {self.fps}", (200, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1)
+        for f in face_dir.glob('*'):
+            if not f.is_file():
+                continue
+                
+            name = f.stem.split('-')[0]
+            img = face_recognition.load_image_file(str(f))
+            enc = face_recognition.face_encodings(img)
             
-            rec_color = (0, 0, 255) if self.rec_alpha > 0.5 else (0, 0, 150)
-            cv2.putText(frame, "REC", (200, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.7, rec_color, 2)
+            if enc:
+                if name not in self.faces:
+                    self.faces[name] = []
+                self.faces[name].append(enc[0])
+
+    def process(self, frame: np.ndarray) -> np.ndarray:
+        if frame is None:
+            return np.zeros((480, 640, 3), dtype=np.uint8)
+            
+        res = self.face_det.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        
+        if res.detections:
+            for det in res.detections:
+                box = det.location_data.relative_bounding_box
+                h, w, _ = frame.shape
+                x, y = int(box.xmin * w), int(box.ymin * h)
+                width, height = int(box.width * w), int(box.height * h)
+                
+                if width > 0 and height > 0:
+                    face_img = frame[y:y+height, x:x+width]
+                    face_img_rgb = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
+                    face = face_recognition.face_encodings(face_img_rgb)
+                    
+                    name = "Unknown"
+                    if face:
+                        for known_name, known_faces in self.faces.items():
+                            if any(face_recognition.compare_faces(
+                                known_faces, face[0])):
+                                name = known_name
+                                break
+                    
+                    cv2.rectangle(frame, (x, y), (x + width, y + height),
+                                (0, 255, 0), 2)
+                    cv2.putText(frame, name, (x, y - 10),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
         
         return frame
 
-    def analyze(self, frame: np.ndarray) -> Frame:
-        """Analyze frame for faces and motion"""
-        try:
-            # Face detection
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = self.detector.process(rgb)
-            
-            faces = 0
-            if results.detections:
-                faces = len(results.detections)
-                for det in results.detections:
-                    bbox = det.location_data.relative_bounding_box
-                    h, w = frame.shape[:2]
-                    x = int(bbox.xmin * w)
-                    y = int(bbox.ymin * h)
-                    width = int(bbox.width * w)
-                    height = int(bbox.height * h)
-                    
-                    # Draw face box
-                    cv2.rectangle(frame, (x, y), (x + width, y + height), (0, 255, 0), 2)
-                    
-                    # Confidence score
-                    conf = f"{int(det.score[0] * 100)}%"
-                    cv2.putText(frame, conf, (x, y - 10), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-            
-            # Motion detection
-            mask = self.bg_sub.apply(frame)
-            motion = np.sum(mask > 0) / (mask.shape[0] * mask.shape[1])
-            
-            if motion > 0.01:
-                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, 
-                                             cv2.CHAIN_APPROX_SIMPLE)
-                for cnt in contours:
-                    if cv2.contourArea(cnt) > 100:
-                        x, y, w, h = cv2.boundingRect(cnt)
-                        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
-            
-            return Frame(faces, motion)
-            
-        except Exception as e:
-            print(f"Analysis error: {e}")
-            return Frame(0, 0.0)
-
-    def calc_fps(self, frame: Frame) -> int:
-        """Calculate target FPS based on activity"""
-        base = self.min_fps
+class Client:
+    def __init__(self, url: str = "ws://localhost:5000"):
+        self.url = url
+        self.processor = Processor()
+        self.queue = Queue()
+        self.running = True
         
-        # Increase for faces
-        if frame.faces > 0:
-            base += frame.faces * 5
-        
-        # Increase for motion
-        if frame.motion > 0.01:
-            motion_fps = int(frame.motion * 100)
-            base += motion_fps
-        
-        return min(max(base, self.min_fps), self.max_fps)
-
-    async def process(self, data: bytes) -> Optional[np.ndarray]:
-        """Process received frame data"""
-        try:
-            nparr = np.frombuffer(data, np.uint8)
-            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            
-            if frame is None:
-                raise ValueError("Frame decode failed")
-            
-            return frame
-            
-        except Exception as e:
-            print(f"Process error: {e}")
-            self.errors += 1
-            return None
-
-    async def run(self):
-        """Main loop"""
-        while True:
+    async def connect(self):
+        while self.running:
             try:
                 async with websockets.connect(self.url) as ws:
-                    print(f"Connected to {self.url}")
-                    self.errors = 0
-
-                    while True:
-                        # Get frame
-                        data = await ws.recv()
-                        frame = await self.process(data)
-                        
-                        if frame is None:
-                            if self.errors >= self.max_errors:
-                                print("Too many errors, reconnecting...")
-                                break
-                            continue
-
-                        # Analyze and update FPS
-                        analysis = self.analyze(frame)
-                        target = self.calc_fps(analysis)
-                        
-                        if target != self.fps:
-                            req = {
-                                "target_fps": target,
-                                "faces_detected": analysis.faces,
-                                "motion_level": float(analysis.motion)
-                            }
-                            await ws.send(json.dumps(req))
-                            self.fps = target
-                        
-                        # Add overlay and display
-                        frame = self.draw_overlay(frame)
-                        cv2.imshow('Security Camera', frame)
-                        
-                        if cv2.waitKey(1) & 0xFF == ord('q'):
-                            return
-
-            except websockets.exceptions.ConnectionClosed:
-                print("Connection lost , reconnecting...")
+                    await asyncio.gather(
+                        self._receive(ws),
+                        self._process(),
+                        self._display()
+                    )
+            except Exception:
                 await asyncio.sleep(1)
-            except Exception as e:
-                print(f"Error: {e}")
-                await asyncio.sleep(1)
+                
+    async def _receive(self, ws):
+        while self.running:
+            try:
+                data = await ws.recv()
+                arr = np.frombuffer(data, np.uint8)
+                frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if frame is not None:
+                    await self.queue.add_raw(frame)
+            except:
+                break
+                
+    async def _process(self):
+        while self.running:
+            frame_data = await self.queue.get_raw()
+            if frame_data:
+                frame_id, frame = frame_data
+                processed = self.processor.process(frame)
+                await self.queue.add_processed(frame_id)
+            await asyncio.sleep(0.01)
+                
+    async def _display(self):
+        while self.running:
+            frame = await self.queue.get_processed()
+            cv2.imshow('Video', frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                self.running = False
+            await asyncio.sleep(0.01)
+        
+    def stop(self):
+        self.running = False
+
+async def main():
+    client = Client()
+    try:
+        await client.connect()
+    finally:
+        client.stop()
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    cam = Cam()
-    asyncio.run(cam.run())
+    try:
+        asyncio.run(main())
+    finally:
+        cv2.destroyAllWindows()
